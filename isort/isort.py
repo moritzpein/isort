@@ -40,9 +40,9 @@ from glob import glob
 from sys import path as PYTHONPATH
 from sys import stdout
 
-from . import settings
-from .natural import nsorted
-from .pie_slice import *
+from isort.natural import nsorted
+from isort import settings
+from isort.pie_slice import *  # noqa
 
 KNOWN_SECTION_MAPPING = {
     'STDLIB': 'STANDARD_LIBRARY',
