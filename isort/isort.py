@@ -57,13 +57,119 @@ class SortImports(object):
     skipped = False
 
     def __init__(self, file_path=None, file_contents=None, write_to_stdout=False, check=False,
-                 show_diff=False, settings_path=None, ask_to_apply=False,  **setting_overrides):
-        if not settings_path and file_path:
-            settings_path = os.path.dirname(os.path.abspath(file_path))
-        settings_path = settings_path or os.getcwd()
+                 show_diff=False, settings_path=None, ask_to_apply=False, **setting_overrides):
+        # input parameters
+        self.file_path = file_path or ""
+        self.file_contents = file_contents
+        self.write_to_stdout = write_to_stdout
+        self.check = check
+        self.show_diff = show_diff
+        self.settings_path = settings_path
+        self.ask_to_apply = ask_to_apply
+        self.setting_overrides = setting_overrides
 
-        self.config = settings.from_path(settings_path).copy()
-        for key, value in itemsview(setting_overrides):
+        # initialize config
+        self._init_settings_path()
+        self.config = settings.from_path(self.settings_path).copy()
+        self._handle_config_overrides()
+        self.config['indent'] = self._init_indent()
+
+        self._prepare_state_vars()
+
+        self.input_was_filename = bool(file_path)
+        # TODO(moritzpein): this is not satisfying, but works for now. We will handle it better later.
+        if self.input_was_filename:
+            self._validate_input()
+
+        # cancel here if the input is not valid.
+        if self.file_contents is None or ("isort:" + "skip_file") in self.file_contents:
+            return
+
+        # TODO(moritzpein): keeping this in the __init__() for now.
+        self._run()
+
+    # TODO(moritzpein): This is still waaay to big and does too many things.
+    # This will be my task for the next session.
+    def _run(self):
+        self.remove_imports = [self._format_simplified(removal) for removal in self.config.get('remove_imports', [])]
+        self._section_comments = ["# " + value for key, value in itemsview(self.config) if
+                                  key.startswith('import_heading') and value]
+        self.in_lines = self.file_contents.split("\n")
+        self.original_length = len(self.in_lines)
+        self.add_imports = [self._format_natural(addition) for addition in self.config.get('add_imports', [])]
+        if (self.original_length > 1 or self.in_lines[:1] not in ([], [""])) or self.config.get('force_adds', False):
+            for add_import in self.add_imports:
+                self.in_lines.append(add_import)
+        self.number_of_lines = len(self.in_lines)
+
+        section_names = self.config.get('sections')
+        self.sections = namedtuple('Sections', section_names)(*[n for n in section_names])
+        for section in itertools.chain(self.sections, self.config['forced_separate']):
+            self.imports[section] = {'straight': set(), 'from': {}}
+
+        self._parse()
+
+        if self.import_index != -1:
+            self._add_formatted_imports()
+
+        self.length_change = len(self.out_lines) - self.original_length
+        while self.out_lines and self.out_lines[-1].strip() == "":
+            self.out_lines.pop(-1)
+        self.out_lines.append("")
+
+        self.output = "\n".join(self.out_lines)
+
+        # don't write stuff if the changed file contains errors
+        if self.config.get('atomic', False):
+            try:
+                compile(self._strip_top_comments(self.out_lines), self.file_path, 'exec', 0, 1)
+            except SyntaxError:
+                self.output = self.file_contents
+                self.incorrectly_sorted = True
+                try:
+                    compile(self._strip_top_comments(self.in_lines), self.file_path, 'exec', 0, 1)
+                    print("ERROR: {0} isort would have introduced syntax errors, please report to the project!". \
+                          format(self.file_path))
+                except SyntaxError:
+                    print("ERROR: {0} File contains syntax errors.".format(self.file_path))
+                return
+
+        # TODO(moritzpein): remove this later.
+        self._generate_output()
+
+    def _prepare_state_vars(self):
+        self.as_map = {}
+        self.comments = {'from': {}, 'straight': {}, 'nested': {}, 'above': {'straight': {}, 'from': {}}}
+        self.import_placements = {}
+        self.imports = {}
+        self.out_lines = []
+        self.place_imports = {}
+        self.index = 0
+        self.import_index = -1
+        self._first_comment_index_start = -1
+        self._first_comment_index_end = -1
+
+    def _validate_input(self):
+        absolute_path = os.path.abspath(self.file_path)
+        if settings.should_skip(absolute_path, self.config):
+            self.skipped = True
+            if self.config['verbose']:
+                print("WARNING: {0} was skipped as it's listed in 'skip' setting"
+                      " or matches a glob in 'skip_glob' setting".format(file_path))
+            self.file_contents = None
+        elif not self.file_contents:
+            self.file_path = self.file_path
+            self.file_encoding = coding_check(self.file_path)
+            with codecs.open(self.file_path, encoding=self.file_encoding) as file_to_import_sort:
+                self.file_contents = file_to_import_sort.read()
+
+    def _init_settings_path(self):
+        if not self.settings_path and self.file_path:
+            self.settings_path = os.path.dirname(os.path.abspath(self.file_path))
+        self.settings_path = self.settings_path or os.getcwd()
+
+    def _handle_config_overrides(self):
+        for key, value in itemsview(self.setting_overrides):
             access_key = key.replace('not_', '').lower()
             # The sections config needs to retain order and can't be converted to a set.
             if access_key != 'sections' and type(self.config.get(access_key)) in (list, tuple):
@@ -74,6 +180,7 @@ class SortImports(object):
             else:
                 self.config[key] = value
 
+    def _init_indent(self):
         indent = str(self.config['indent'])
         if indent.isdigit():
             indent = " " * int(indent)
@@ -81,113 +188,45 @@ class SortImports(object):
             indent = indent.strip("'").strip('"')
             if indent.lower() == "tab":
                 indent = "\t"
-        self.config['indent'] = indent
+        return indent
 
-        self.place_imports = {}
-        self.import_placements = {}
-        self.remove_imports = [self._format_simplified(removal) for removal in self.config.get('remove_imports', [])]
-        self.add_imports = [self._format_natural(addition) for addition in self.config.get('add_imports', [])]
-        self._section_comments = ["# " + value for key, value in itemsview(self.config) if
-                                  key.startswith('import_heading') and value]
-
-        self.file_encoding = 'utf-8'
-        file_name = file_path
-        self.file_path = file_path or ""
-        if file_path:
-            file_path = os.path.abspath(file_path)
-            if settings.should_skip(file_path, self.config):
-                self.skipped = True
-                if self.config['verbose']:
-                    print("WARNING: {0} was skipped as it's listed in 'skip' setting"
-                          " or matches a glob in 'skip_glob' setting".format(file_path))
-                file_contents = None
-            elif not file_contents:
-                self.file_path = file_path
-                self.file_encoding = coding_check(file_path)
-                with codecs.open(file_path, encoding=self.file_encoding) as file_to_import_sort:
-                    file_contents = file_to_import_sort.read()
-
-        if file_contents is None or ("isort:" + "skip_file") in file_contents:
-            return
-
-        self.in_lines = file_contents.split("\n")
-        self.original_length = len(self.in_lines)
-        if (self.original_length > 1 or self.in_lines[:1] not in ([], [""])) or self.config.get('force_adds', False):
-            for add_import in self.add_imports:
-                self.in_lines.append(add_import)
-        self.number_of_lines = len(self.in_lines)
-
-        self.out_lines = []
-        self.comments = {'from': {}, 'straight': {}, 'nested': {}, 'above': {'straight': {}, 'from': {}}}
-        self.imports = {}
-        self.as_map = {}
-
-        section_names = self.config.get('sections')
-        self.sections = namedtuple('Sections', section_names)(*[n for n in section_names])
-        for section in itertools.chain(self.sections, self.config['forced_separate']):
-            self.imports[section] = {'straight': set(), 'from': {}}
-
-        self.index = 0
-        self.import_index = -1
-        self._first_comment_index_start = -1
-        self._first_comment_index_end = -1
-        self._parse()
-        if self.import_index != -1:
-            self._add_formatted_imports()
-
-        self.length_change = len(self.out_lines) - self.original_length
-        while self.out_lines and self.out_lines[-1].strip() == "":
-            self.out_lines.pop(-1)
-        self.out_lines.append("")
-
-        self.output = "\n".join(self.out_lines)
-        if self.config.get('atomic', False):
-            try:
-                compile(self._strip_top_comments(self.out_lines), self.file_path, 'exec', 0, 1)
-            except SyntaxError:
-                self.output = file_contents
-                self.incorrectly_sorted = True
-                try:
-                    compile(self._strip_top_comments(self.in_lines), self.file_path, 'exec', 0, 1)
-                    print("ERROR: {0} isort would have introduced syntax errors, please report to the project!". \
-                          format(self.file_path))
-                except SyntaxError:
-                    print("ERROR: {0} File contains syntax errors.".format(self.file_path))
-
-                return
-        if check:
-            if self.output.replace("\n", "").replace(" ", "") == file_contents.replace("\n", "").replace(" ", ""):
+    def _generate_output(self):
+        if self.check:
+            if self.output.replace("\n", "").replace(" ", "") == self.file_contents.replace("\n", "").replace(" ", ""):
                 if self.config['verbose']:
                     print("SUCCESS: {0} Everything Looks Good!".format(self.file_path))
             else:
                 print("ERROR: {0} Imports are incorrectly sorted.".format(self.file_path))
                 self.incorrectly_sorted = True
-                if show_diff or self.config.get('show_diff', False) is True:
-                    self._show_diff(file_contents)
+                if self.show_diff or self.config.get('show_diff', False) is True:
+                    self._show_diff(self.file_contents)
             return
 
-        if show_diff or self.config.get('show_diff', False) is True:
-            self._show_diff(file_contents)
-        elif write_to_stdout:
+        if self.show_diff or self.config.get('show_diff', False):
+            self._show_diff(self.file_contents)
+        elif self.write_to_stdout:
             stdout.write(self.output)
-        elif file_name:
-            if ask_to_apply:
-                if self.output == file_contents:
-                    return
-                self._show_diff(file_contents)
-                answer = None
-                while answer not in ('yes', 'y', 'no', 'n', 'quit', 'q'):
-                    answer = input("Apply suggested changes to '{0}' [Y/n/q]?".format(self.file_path)).lower()
-                    if answer in ('no', 'n'):
-                        return
-                    if answer in ('quit', 'q'):
-                        sys.exit(1)
+        elif self.input_was_filename:
+            if self.ask_to_apply:
+                self._ask_user()
             with codecs.open(self.file_path, encoding=self.file_encoding, mode='w') as output_file:
                 output_file.write(self.output)
 
-    def _show_diff(self, file_contents):
+    def _ask_user(self):
+        if self.output == self.file_contents:
+            return
+        self._show_diff(self.file_contents)
+        answer = None
+        while answer not in ('yes', 'y', 'no', 'n', 'quit', 'q'):
+            answer = input("Apply suggested changes to '{0}' [Y/n/q]?".format(self.file_path)).lower()
+            if answer in ('no', 'n'):
+                return
+            if answer in ('quit', 'q'):
+                sys.exit(1)
+
+    def _show_diff(self):
         for line in unified_diff(
-            file_contents.splitlines(1),
+            self.file_contents.splitlines(1),
             self.output.splitlines(1),
             fromfile=self.file_path + ':before',
             tofile=self.file_path + ':after',
@@ -332,6 +371,7 @@ class SortImports(object):
                 section_output.extend(comments_above)
             section_output.append(self._add_comments(self.comments['straight'].get(module), import_definition))
 
+    # TODO(moritzpein): this is waaay huge. Let's split it up.
     def _add_from_imports(self, from_modules, section, section_output):
         for module in from_modules:
             if module in self.remove_imports:
